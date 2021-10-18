@@ -23,7 +23,7 @@ WRITER = SummaryWriter()
 
 
 def tokenize_data(example, tokenizer, max_length):
-    tokens = tokenizer(example['test'])[:max_length]
+    tokens = tokenizer(example['text'])[:max_length]
     length = len(tokens)
     return {'tokens': tokens, 'length': length}
 
@@ -57,20 +57,23 @@ def collate_batch(batch, pad_index):
 
 
 class RNN(nn.Module):
-    def __init__(self, input_dim, embedding_dim, hidden_dim, output_dim):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, dropout_rate, pad_index):
         super().__init__()
-        self.embedding = nn.Embedding(input_dim, embedding_dim)
-        self.rnn = nn.RNN(embedding_dim, hidden_dim)
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_index)
+        self.rnn = nn.RNN(embedding_dim, hidden_dim, dropout=dropout_rate, batch_first=True, nonlinearity='relu')
         self.linear = nn.Linear(hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, text):  # text: [sent len(pad included), batch size]
-        embedded = self.embedding(text)  # embedded: [sent len, batch size, hidden dim]
-
-        output, hidden = self.rnn(embedded)
-        # output: [sent len, batch size, hidden dim] -- concatenation of hidden states
-        # hidden: [1, batch size,hidden dim] -- final hidden state
-
-        assert torch.equal(output[-1, :, :], hidden.squeeze(0))
+    def forward(self, ids, length):  # text: [sent len(pad included), batch size]
+        embedded = self.embedding(ids)  # embedded: [sent len, batch size, hidden dim]
+        packed_embedded = torch.nn.utils.rnn.pack_padded_sequence(embedded, length, batch_first=True,
+                                                                  enforce_sorted=False)
+        packed_output, hidden = self.rnn(packed_embedded)
+        hidden = self.dropout(hidden[-1])
+        # packed_output: [batch size, seq len, hidden dim * n directions]
+        # hidden: [batch size, hidden dim]
+        prediction = self.linear(hidden)
+        return prediction
 
 
 def count_params(m) -> int:
@@ -87,10 +90,9 @@ def binary_accuracy(pred, y):
     :param y: the true label
     :return: accuracy value (per batch)
     """
-    batch_size, _ = pred.shape
     predicted_classes = pred.argmax(dim=-1)
     correct = predicted_classes.eq(y).sum()
-    acc = correct / batch_size
+    acc = correct / float(pred.shape[0])
     return acc
 
 
@@ -102,8 +104,8 @@ def train(dataloader, model, criterion, optimizer, device):
     for e, batch in enumerate(tqdm(dataloader, desc='Training...', file=sys.stdout)):
         ids = batch['ids'].to(device)
         length = batch['length']
-        label = batch['label'].to(device)
-        prediction = model(ids, length)
+        label = batch['label'].to(device, dtype=torch.float)
+        prediction = model(ids, length).squeeze(1)
         loss = criterion(prediction, label)
         accuracy = binary_accuracy(prediction, label)
         WRITER.add_scalar("Loss/Train", loss, e)
@@ -127,8 +129,8 @@ def evaluate(dataloader, model, criterion, device):
     for e, batch in enumerate(tqdm(dataloader, desc='Evaluating...', file=sys.stdout)):
         ids = batch['ids'].to(device)
         length = batch['length']
-        label = batch['label'].to(device)
-        prediction = model(ids, length)
+        label = batch['label'].to(device, dtype=torch.float)
+        prediction = model(ids, length).squeeze(1)
         loss = criterion(prediction, label)
         accuracy = binary_accuracy(prediction, label)
         WRITER.add_scalar("Loss/Test", loss, e)
@@ -159,9 +161,9 @@ if __name__ == "__main__":
     tokenizer = get_tokenizer('spacy', "en_core_web_sm")
 
     # tokenization
-    max_lenght = 256
-    train_data = train_data.map(tokenize_data, fn_kwargs={'tokenizer': tokenizer, 'max_length': max_lenght})
-    test_data = test_data.map(tokenize_data, fn_kwargs={'tokenizer': tokenizer, 'max_length': max_lenght})
+    max_length = 256
+    train_data = train_data.map(tokenize_data, fn_kwargs={'tokenizer': tokenizer, 'max_length': max_length})
+    test_data = test_data.map(tokenize_data, fn_kwargs={'tokenizer': tokenizer, 'max_length': max_length})
 
     # split train/validation set
     test_size = 0.25
@@ -176,13 +178,16 @@ if __name__ == "__main__":
     # build vocab
     min_freq = 5  # words that do not appear under 5 times will be ignored
     special_tok = ['<unk>', '<pad>']
-    vocab = torchtext.vocab.build_vocab_from_iterator(train_data['text'], min_freq=min_freq,
-                                                      specials=special_tok)
+    vocab = torchtext.vocab.build_vocab_from_iterator(train_data['text'], min_freq=min_freq, specials=special_tok)
 
     unk_idx = vocab['<unk>']
     pad_idx = vocab['<pad>']
 
     vocab.set_default_index(unk_idx)  # token for OOV words
+
+    train_data = train_data.map(numericalize_data, fn_kwargs={'vocab': vocab})
+    valid_data = valid_data.map(numericalize_data, fn_kwargs={'vocab': vocab})
+    test_data = test_data.map(numericalize_data, fn_kwargs={'vocab': vocab})
 
     train_data = train_data.with_format(type='torch', columns=['ids', 'label', 'length'])
     valid_data = valid_data.with_format(type='torch', columns=['ids', 'label', 'length'])
@@ -201,9 +206,10 @@ if __name__ == "__main__":
     EMBEDDING_DIM = 100  # size of dense word vectors
     HIDDEN_DIM = 256  # size of hidden states
     OUTPUT_DIM = 1  # number of classes (for binary classification, this can be 1 dim)
+    DROPOUT_RATE = 0.5
 
     # RNN instance
-    model = RNN(VOCAB_SIZE, EMBEDDING_DIM, HIDDEN_DIM, OUTPUT_DIM)
+    model = RNN(VOCAB_SIZE, EMBEDDING_DIM, HIDDEN_DIM, OUTPUT_DIM, DROPOUT_RATE, pad_idx)
 
     print('Model has {count:,} trainable parameters'.format(count=count_params(model)))
 
@@ -242,17 +248,17 @@ if __name__ == "__main__":
         epoch_valid_loss = np.mean(valid_loss)
         epoch_valid_acc = np.mean(valid_acc)
 
-        if valid_loss < best_valid_loss:
-            best_valid_loss = valid_loss
+        if epoch_valid_loss < best_valid_loss:
+            best_valid_loss = epoch_valid_loss
             torch.save(model.state_dict(), 'SSA1_model.pt')
 
         print(f'Epoch: {epoch + 1} | Epoch Time: {epoch_mins}m {epoch_secs}s')
-        print(f'\tTrain Loss: {train_loss:.3f} | Train Acc: {train_acc * 100:.2f}%')
-        print(f'\t Val. Loss: {valid_loss:.3f} |  Val. Acc: {valid_acc * 100:.2f}%')
+        print(f'\tTrain Loss: {epoch_train_loss:.3f} | Train Acc: {epoch_train_acc * 100:.2f}%')
+        print(f'\t Val. Loss: {epoch_valid_loss:.3f} |  Val. Acc: {epoch_valid_acc * 100:.2f}%')
         WRITER.flush()
 
     # measure test loss and accuracy
     model.load_state_dict(torch.load('SSA1_model.pt'))
     test_loss, test_acc = evaluate(test_dataloader, model, criterion, device)
-    print(f'Test Loss: {test_loss:.3f} | Test Acc: {test_acc * 100:.2f}%')
+    print(f'Test Loss: {test_loss[0]:.3f} | Test Acc: {test_acc[0] * 100:.2f}%')
     WRITER.close()
